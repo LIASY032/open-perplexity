@@ -1,0 +1,39 @@
+{
+  "name": "open-perplexity",
+  "version": "0.1.0",
+  "description": "Perplexity web automation through Chrome DevTools Protocol, packaged as a reusable CLI and Codex/OpenClaw-friendly plugin.",
+  "author": {
+    "name": "LIASY032",
+    "url": "https://github.com/LIASY032"
+  },
+  "homepage": "https://github.com/LIASY032/open-perplexity",
+  "repository": "https://github.com/LIASY032/open-perplexity",
+  "license": "MIT",
+  "keywords": [
+    "perplexity",
+    "cdp",
+    "chrome",
+    "automation",
+    "plugin",
+    "skill"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Open Perplexity",
+    "shortDescription": "Ask Perplexity from a reusable local CLI.",
+    "longDescription": "Automates the Perplexity web app through Chrome DevTools Protocol so users can reuse their logged-in browser session from Codex, OpenClaw, or plain terminal workflows.",
+    "developerName": "LIASY032",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Local Automation"
+    ],
+    "websiteURL": "https://github.com/LIASY032/open-perplexity",
+    "defaultPrompt": [
+      "Run Open Perplexity with a prompt file.",
+      "Ask Perplexity with the Claude model.",
+      "Save a Perplexity reply to a markdown file."
+    ],
+    "brandColor": "#0F766E"
+  }
+}
