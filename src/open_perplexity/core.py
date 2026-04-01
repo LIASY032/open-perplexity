@@ -20,7 +20,9 @@ from urllib.parse import quote, urlparse
 DEFAULT_CDP_PORT = 9222
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_URL = "https://www.perplexity.ai/"
-DEFAULT_PROFILE_DIR = Path.home() / ".open-perplexity" / "chrome-profile"
+# Dedicated CDP profile dir (same idea as perplexity_cdp.py: avoids fighting the daily Chrome lock).
+# 独立 CDP 用户目录，避免与日常 Chrome 实例抢 Singleton 锁。
+DEFAULT_PROFILE_DIR = Path.home() / ".config" / "google-chrome-cdp"
 
 MODEL_KEYWORDS = {
     "gpt": "GPT",
@@ -62,17 +64,136 @@ JS_SUBMIT = """
 })()
 """
 
-JS_GET_RESPONSE = """
-(function() {
-    var blocks = document.querySelectorAll('[class*="prose"], [class*="answer"], [class*="response"], [class*="markdown"]');
-    var texts = [];
-    for (var b of blocks) {
-        var t = b.innerText.trim();
-        if (t.length > 20) texts.push(t);
-    }
-    if (texts.length > 0) return texts.join('\\n---\\n');
+def build_js_extract_latest_reply(user_prompt: str) -> str:
+    """Build JS that returns the latest assistant text, skipping a trailing user-query echo.
+    生成用于提取助手回复的 JS，并跳过末尾与用户问题相同的 DOM 块。"""
+    up = json.dumps(user_prompt or "")
+    return f"""
+(function() {{
+    var USER_PROMPT = {up};
+    var SELECTORS =
+        '[class*="prose"], [class*="markdown"], [class*="answer"], [class*="response"], ' +
+        '[class*="Message"], [class*="message-body"], [class*="query-text"], ' +
+        '[data-testid*="answer"], [data-testid*="message"], article, ' +
+        '[class*="break-words"], [class*="mdx"], [class*="font-display"]';
+    function visible(el) {{
+        var s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity || '1') === 0) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 2 && r.height > 2;
+    }}
+    function inSidebar(el) {{
+        var p = el;
+        for (var d = 0; d < 14 && p; d++) {{
+            var t = (p.tagName || '').toLowerCase();
+            if (t === 'aside') return true;
+            var role = p.getAttribute && p.getAttribute('role');
+            if (role === 'navigation') return true;
+            var cls = (p.className && p.className.toString) ? p.className.toString().toLowerCase() : '';
+            if (cls.indexOf('sidebar') >= 0 || cls.indexOf('side-bar') >= 0) return true;
+            p = p.parentElement;
+        }}
+        return false;
+    }}
+    function norm(s) {{
+        return ((s || '') + '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    }}
+    function isUserEcho(text) {{
+        var t = norm(text);
+        var u = norm(USER_PROMPT);
+        if (!u || !t) return false;
+        if (t === u) return true;
+        if (t.indexOf(u) === 0 && t.length <= u.length + 20) return true;
+        if (u.indexOf(t) === 0 && u.length <= t.length + 20) return true;
+        return false;
+    }}
+    function inAssistantTurn(el) {{
+        var p = el;
+        for (var d = 0; d < 14 && p; d++) {{
+            var r = p.getAttribute && p.getAttribute('data-message-author-role');
+            if (r === 'assistant') return true;
+            r = p.getAttribute && p.getAttribute('data-role');
+            if (r === 'assistant') return true;
+            p = p.parentElement;
+        }}
+        return false;
+    }}
+    function inUserTurn(el) {{
+        var p = el;
+        for (var d = 0; d < 14 && p; d++) {{
+            var r = p.getAttribute && p.getAttribute('data-message-author-role');
+            if (r === 'user') return true;
+            r = p.getAttribute && p.getAttribute('data-role');
+            if (r === 'user') return true;
+            p = p.parentElement;
+        }}
+        return false;
+    }}
+    function collectBlocks(root, minLen) {{
+        var nodes = root.querySelectorAll(SELECTORS);
+        var blocks = [];
+        var assistantOnly = [];
+        for (var i = 0; i < nodes.length; i++) {{
+            var n = nodes[i];
+            if (!visible(n) || inSidebar(n)) continue;
+            if (inUserTurn(n)) continue;
+            var text = (n.innerText || '').trim();
+            if (text.length < minLen) continue;
+            if (isUserEcho(text)) continue;
+            blocks.push(text);
+            if (inAssistantTurn(n)) assistantOnly.push(text);
+        }}
+        if (assistantOnly.length > 0) return assistantOnly;
+        return blocks;
+    }}
+    function pickAssistant(blocks) {{
+        for (var i = blocks.length - 1; i >= 0; i--) {{
+            if (!isUserEcho(blocks[i])) return blocks[i];
+        }}
+        if (blocks.length >= 2) return blocks[blocks.length - 2];
+        return '';
+    }}
+    function lastAssistant(root, minLen) {{
+        var blocks = collectBlocks(root, minLen);
+        if (blocks.length === 0) return '';
+        return pickAssistant(blocks);
+    }}
     var main = document.querySelector('main') || document.body;
-    return main.innerText.substring(0, 50000);
+    var thread = main.querySelector(
+        '[class*="thread"], [class*="Thread"], [class*="conversation"], ' +
+        '[role="log"], [data-testid*="message"], [class*="MessageList"]'
+    );
+    var out = '';
+    // Narrow thread containers sometimes wrap only the user query; do not trust them alone.
+    // 窄 thread 容器有时只包住用户问题，不能单独当作答案来源。
+    if (thread) out = lastAssistant(thread, 25);
+    if (out && isUserEcho(out)) out = '';
+    if (!out) out = lastAssistant(main, 25);
+    if (out && isUserEcho(out)) out = '';
+    if (!out) out = lastAssistant(main, 12);
+    if (out && isUserEcho(out)) out = '';
+    if (!out) out = lastAssistant(main, 2);
+    if (!out) {{
+        var candidates = main.querySelectorAll('div, section');
+        var best = '';
+        for (var j = 0; j < candidates.length; j++) {{
+            var el = candidates[j];
+            if (!visible(el) || inSidebar(el)) continue;
+            var tx = (el.innerText || '').trim();
+            if (tx.length < 80 || tx.length > 150000) continue;
+            if (el.querySelectorAll('div').length > 120) continue;
+            if (isUserEcho(tx)) continue;
+            if (tx.length > best.length) best = tx;
+        }}
+        out = best;
+    }}
+    return out;
+}})()
+"""
+
+JS_PAGE_LOCATION = """
+(function() {
+    return window.location.href || '';
 })()
 """
 
@@ -83,6 +204,14 @@ JS_CHECK_LOADING = """
         var style = window.getComputedStyle(s);
         if (style.display !== 'none' && style.visibility !== 'hidden' && s.offsetHeight > 0) {
             return true;
+        }
+    }
+    var btns = document.querySelectorAll('button');
+    for (var b of btns) {
+        var t = ((b.innerText || b.textContent || '') + '').trim().toLowerCase();
+        if (t === 'stop' || t.indexOf('stop generating') >= 0) {
+            var st = window.getComputedStyle(b);
+            if (st.display !== 'none' && b.offsetParent !== null) return true;
         }
     }
     return false;
@@ -233,6 +362,29 @@ def is_cdp_reachable(port: int) -> bool:
         return False
 
 
+def is_chrome_running() -> bool:
+    """Best-effort: true if a typical Chrome/Chromium process is running (Linux only).
+    尽力检测：Linux 上是否存在常见 Chrome/Chromium 进程。"""
+    if sys.platform != "linux":
+        return False
+    try:
+        for pattern in ("google-chrome", "chromium-browser", "chromium"):
+            try:
+                subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                return True
+            except subprocess.CalledProcessError:
+                continue
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False
+
+
 def find_perplexity_tab(port: int) -> Optional[Dict[str, Any]]:
     tabs = cdp_http(port, "/json")
     for tab in tabs:
@@ -364,8 +516,24 @@ def ensure_chrome_with_cdp(
     verbose: bool,
 ) -> None:
     if is_cdp_reachable(port):
-        log(f"Chrome CDP is already reachable on port {port}.", verbose=verbose)
+        log(
+            f"INFO: Chrome CDP 已可达 (port {port}) / Chrome CDP is already reachable on port {port}.",
+            verbose=verbose,
+        )
         return
+
+    if is_chrome_running():
+        log(
+            "INFO: Chrome 已运行但未开启 CDP，将启动独立 CDP 实例 / "
+            "Chrome is running but CDP is not enabled; launching a separate CDP instance.",
+            verbose=verbose,
+        )
+    else:
+        log(
+            "INFO: Chrome 未运行，启动带 CDP 的 Chrome / "
+            "Chrome is not running; launching Chrome with CDP.",
+            verbose=verbose,
+        )
 
     browser = chrome_path or detect_chrome_binary()
     if not browser:
@@ -387,10 +555,16 @@ def ensure_chrome_with_cdp(
     log(f"Launching Chrome with CDP on port {port}.", verbose=verbose)
     subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    for attempt in range(20):
+    # Same cadence as perplexity_cdp.py (15s) but allow a few more seconds for slow profile copies.
+    # 与 perplexity_cdp.py 类似的等待节奏，多留几秒给慢速 profile 复制。
+    for attempt in range(25):
         time.sleep(1)
         if is_cdp_reachable(port):
-            log(f"Chrome CDP is ready after {attempt + 1} second(s).", verbose=verbose)
+            log(
+                f"INFO: Chrome CDP 启动成功 (port {port}, {attempt + 1}s) / "
+                f"Chrome CDP is ready after {attempt + 1} second(s).",
+                verbose=verbose,
+            )
             return
     raise OpenPerplexityError("Chrome CDP startup timed out.")
 
@@ -470,6 +644,21 @@ def select_model(ws: SimpleWebSocket, model_name: str, *, verbose: bool) -> bool
     model = json.loads(model_raw)
     if "error" in model:
         log(f"Could not find a visible model containing '{keyword}'.", verbose=verbose)
+        try:
+            esc_id = cdp_send(
+                ws,
+                "Input.dispatchKeyEvent",
+                {
+                    "type": "keyDown",
+                    "key": "Escape",
+                    "code": "Escape",
+                    "windowsVirtualKeyCode": 27,
+                    "nativeVirtualKeyCode": 27,
+                },
+            )
+            cdp_recv_result(ws, esc_id, timeout=5)
+        except Exception:
+            pass
         return False
 
     log(f"Selecting model: {model['text']}", verbose=verbose)
@@ -527,6 +716,14 @@ def run_prompt(config: RunConfig) -> str:
         message_id = cdp_send(ws, "Input.insertText", {"text": config.prompt})
         cdp_recv_result(ws, message_id, timeout=10)
 
+        # Snapshot thread text before submit so we can detect a new assistant reply after Enter.
+        # 在按 Enter 之前采样对话区文本，用于提交后对比是否出现新回答。
+        try:
+            baseline_reply = cdp_evaluate(ws, build_js_extract_latest_reply(config.prompt), timeout=10)
+        except Exception:
+            baseline_reply = ""
+        baseline_reply = (baseline_reply or "").strip()
+
         try:
             down_id = cdp_send(
                 ws,
@@ -555,9 +752,37 @@ def run_prompt(config: RunConfig) -> str:
         except Exception:
             cdp_evaluate(ws, JS_SUBMIT, timeout=10)
 
+        time.sleep(1.5)
+        reply_started = False
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                url_now = (cdp_evaluate(ws, JS_PAGE_LOCATION, timeout=5) or "").lower()
+            except Exception:
+                url_now = ""
+            try:
+                snippet = (cdp_evaluate(ws, build_js_extract_latest_reply(config.prompt), timeout=10) or "").strip()
+            except Exception:
+                snippet = ""
+            path_suggests_search = "/search" in url_now
+            text_grew = bool(snippet) and (
+                snippet != baseline_reply
+                or len(snippet) > len(baseline_reply) + 15
+                or len(snippet) >= max(60, len(config.prompt) + 10)
+            )
+            if path_suggests_search or text_grew:
+                reply_started = True
+                break
+
+        if not reply_started:
+            raise OpenPerplexityError(
+                "No new Perplexity answer detected (URL did not move to search and no new thread text). "
+                "Try logging in, or check if the Enter key submitted the prompt."
+            )
+
         elapsed = 0
-        poll_seconds = 3
-        previous_length = 0
+        poll_seconds = 2
+        previous_length = -1
         stable_count = 0
 
         while elapsed < config.timeout_seconds:
@@ -570,13 +795,18 @@ def run_prompt(config: RunConfig) -> str:
                 loading_raw = "false"
 
             try:
-                response = cdp_evaluate(ws, JS_GET_RESPONSE, timeout=10)
+                response = (cdp_evaluate(ws, build_js_extract_latest_reply(config.prompt), timeout=10) or "").strip()
             except Exception:
                 response = ""
 
             current_length = len(response)
             is_loading = loading_raw == "true" or loading_raw is True
-            if current_length > 100 and current_length == previous_length and not is_loading:
+            # Short answers (e.g. "OK") are valid once stable / 短回答稳定后也算完成。
+            if (
+                current_length >= 2
+                and current_length == previous_length
+                and not is_loading
+            ):
                 stable_count += 1
                 if stable_count >= 3:
                     break
@@ -584,8 +814,8 @@ def run_prompt(config: RunConfig) -> str:
                 stable_count = 0
                 previous_length = current_length
 
-        final_response = cdp_evaluate(ws, JS_GET_RESPONSE, timeout=10)
-        if len(final_response.strip()) < 10:
+        final_response = (cdp_evaluate(ws, build_js_extract_latest_reply(config.prompt), timeout=10) or "").strip()
+        if len(final_response) < 2:
             raise OpenPerplexityError("Failed to extract a usable Perplexity response.")
         return final_response
     finally:
