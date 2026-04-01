@@ -105,7 +105,7 @@ open-perplexity --prompt-file FILE
 open-perplexity --model claude
 open-perplexity --timeout 120
 open-perplexity --cdp-port 9222
-open-perplexity --profile-dir ~/.open-perplexity/chrome-profile
+open-perplexity --profile-dir ~/.config/google-chrome-cdp
 open-perplexity --chrome-path /path/to/chrome
 open-perplexity --output-file answer.md
 open-perplexity --quiet
